@@ -2,6 +2,7 @@ from multiprocessing import Pool
 import regex as re
 import os
 from typing import BinaryIO
+import json
 
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
@@ -96,6 +97,9 @@ def pre_and_count_process(
                 freq[pair] = freq.get(pair, 0) + count
 
         return word_counts, freq
+
+def _pre_and_count_task(task):
+    return pre_and_count_process(*task)
 
 def merge_most_freq(tokens: list[list[bytes]], max_pair: tuple[bytes, bytes],freq:dict[tuple[bytes,bytes],int]):
     new_tokens : list[list[bytes]] = []
@@ -193,33 +197,22 @@ def train_bpe(input_path:str,vocab_size:int,special_tokens:list[str]):
         for special_token in encoded_special_tokens:
             chunk_boundaries.extend(find_chunk_boundaries(f, desired_num_chunks, special_token))
     chunk_boundaries = sorted(set(chunk_boundaries))
+    tasks = (
+        (input_path, start, end, special_tokens)
+        for start, end in zip(chunk_boundaries[:-1], chunk_boundaries[1:])
+    )
 
-    tasks = [ (input_path,start,end,special_tokens)
-              for start,end in zip(chunk_boundaries[:-1], chunk_boundaries[1:])]
-    with Pool(processes=4) as pool:
-        results = pool.starmap(pre_and_count_process, tasks)
-
-    # --- OLD: flat list of every pre-token occurrence (kept for reference) ---
-    # pre_tokens = []
-    # freq : dict[tuple[bytes, bytes], int] = {}
-    #
-    # for pre_tokens_chunk, chunk_freq in results:
-    #     pre_tokens.extend(pre_tokens_chunk)
-    #     for pair, count in chunk_freq.items():
-    #         freq[pair] = freq.get(pair, 0) + count
-    #
-    # tokens : list[list[bytes]] = []
-    # for pre_token in pre_tokens:
-    #     tokens.append([pre_token[i:i+1] for i in range(len(pre_token))])
-
-    # --- NEW: merge per-chunk word counts, then build the pair -> words index ---
     word_counts: dict[tuple[bytes, ...], int] = {}
     freq: dict[tuple[bytes, bytes], int] = {}
-    for chunk_word_counts, chunk_freq in results:
-        for symbols, count in chunk_word_counts.items():
-            word_counts[symbols] = word_counts.get(symbols, 0) + count
-        for pair, count in chunk_freq.items():
-            freq[pair] = freq.get(pair, 0) + count
+
+    with Pool(processes=4) as pool:
+        for chunk_word_counts, chunk_freq in pool.imap_unordered(
+            _pre_and_count_task, tasks, chunksize=16
+        ):
+            for symbols, count in chunk_word_counts.items():
+                word_counts[symbols] = word_counts.get(symbols, 0) + count
+            for pair, count in chunk_freq.items():
+                freq[pair] = freq.get(pair, 0) + count
 
     # pair -> set of unique sequences containing that pair, so each merge round
     # only visits sequences that actually contain the chosen pair.
